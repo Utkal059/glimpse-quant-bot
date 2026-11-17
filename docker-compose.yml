@@ -1,0 +1,38 @@
+# Paper trading by default. Real orders need BOTH:
+#   1. GLIMPSE_LIVE_TRADING=true (in .env or the environment), and
+#   2. the command changed to ["run", "--live"].
+#
+#   docker compose up --build                         # run the bot (paper)
+#   docker compose run --rm bot demo-trades           # one-shot example trades
+#   docker compose run --rm bot report                # ledger summary
+#   docker compose --profile record up recorder       # record the feed for backtests
+
+x-bot: &bot
+  build: .
+  image: glimpse-quant-bot:latest
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    GQB_DATA_DIR: /data
+    GLIMPSE_LIVE_TRADING: ${GLIMPSE_LIVE_TRADING:-false}
+  volumes:
+    - ledger:/data                     # ledger.sqlite + audit.ndjson
+    - recordings:/data/recordings      # MarketRecorder NDJSON datasets
+  stop_grace_period: 30s
+
+services:
+  bot:
+    <<: *bot
+    command: ["run"]
+    restart: unless-stopped
+
+  recorder:
+    <<: *bot
+    profiles: ["record"]
+    command: ["record", "--duration", "86400"]
+    restart: "no"
+
+volumes:
+  ledger:
+  recordings:

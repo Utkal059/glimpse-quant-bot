@@ -1,0 +1,206 @@
+﻿# glimpse-quant-bot
+
+A probability-calibration and LS-LMSR execution engine for [Glimpse](https://www.glimpse.markets) — the Bitcoin-settled forecasting market whose contracts pay ₿100 if an asset closes inside a price bucket. The bot forecasts the full closing-price distribution of **BTC, ETH, SOL and Gold**, compares it bucket by bucket with the market maker's quotes, and trades only where the gap survives slippage and fees.
+
+It is built on the official SDK (`glimpse-markets >= 0.2.0`), is MIT-licensed, and **paper-trades by default**: Glimpse has no sandbox, so real orders need two separate opt-ins.
+
+```text
+MarketDataHub ──▶ EnsembleForecaster ──▶ SlippageOptimizer ──▶ RiskManager ──▶ ExecutionRouter
+ Deribit options     options RND             local LS-LMSR         caps, breaker,    SDK calls,
+ Binance/Coinbase/   HAR + microstructure    replica + server      trading lock,     dry_run default,
+ Kraken spot, perps  GJR-GARCH / TimesFM     estimate ladder       reconciler        no blind retries
+                                                    │
+                                              Ledger (append-only SQLite + NDJSON)
+```
+
+## Status
+
+| Check | Result |
+|---|---|
+| `pytest` | 54 passed |
+| `ruff check src tests` | clean |
+| `mypy --strict` on `src` and `tests` | clean |
+| Local LS-LMSR pricer vs live `/trades/estimate` | identical to the millisat (buy, sell, multi-leg, fractional) |
+| Local LS-LMSR pricer vs the Glimpse whitepaper | reproduces every published figure |
+| Live forecast, all four assets | bucket probabilities sum to 1.0 |
+| Dry-run example trades on live markets | [`examples/sample_trades.md`](examples/sample_trades.md) |
+| Live (real-money) order path | **not exercised** — no API key was used in development |
+
+## Quantitative thesis
+
+A Glimpse topic is a 500-bucket partition of the price axis run by a single automated market maker. Its quotes are whatever the last few traders left behind, and depth is thin: the liquidity parameter `b` of live topics is **13–40 contracts**. Three things follow.
+
+1. **The market quotes a full distribution, so a better distribution is an edge in every bucket at once.** The bot builds one from three independent views and pools them:
+
+   | Component | Weight (BTC, ETH) | Weight (SOL, Gold) | What it contributes |
+   |---|---:|---:|---|
+   | **Options risk-neutral density** — Breeden-Litzenberger on a smoothed Deribit smile | 50% | – | The options market's own forward-looking distribution, including skew and fat wings |
+   | **HAR-RV + microstructure** — log-HAR realised variance, skewed Student-t shaped by funding and order-book imbalance | 30% | 60% | Horizon-matched volatility and short-term directional lean |
+   | **GJR-GARCH(1,1)** with filtered historical simulation, or TimesFM 2.5 if installed | 20% | 40% | An empirical, leverage-aware return distribution |
+
+   Weights re-normalise when a component is unavailable (Deribit lists no SOL or gold options), so probabilities always sum to one. Cross-model Jensen-Shannon divergence scales the Kelly fraction down when the models disagree.
+
+2. **Quoted edge is not tradeable edge.** LS-LMSR prices are convex in size. On a topic with `b = 37`, buying 20 contracts of an 18-point bucket costs an average of 22.2 points. The bot therefore prices a ladder of sizes and maximises expected profit *in millisats* after the 2% commission and the 2% settlement fee.
+
+3. **The cost function is public, so pricing can be local.** `lmsr.py` re-implements Glimpse's cost function exactly. Screening candidate sizes costs zero API requests; the rate limit is spent only on confirming the size the bot intends to trade.
+
+**Capacity, stated plainly.** The most a trader can extract from a mispriced bucket is about `100 · b · KL(p_model ‖ p_market)` sats — typically 10–150 sats per trade at today's depth. A 0.001 BTC bankroll is never the binding constraint; market depth is. The Kelly fraction and the 15% / 35% caps exist to prevent ruin, not because they usually bind.
+
+## The mathematics
+
+**LS-LMSR** (Glimpse whitepaper eq. 1–2; Othman, Sandholm, Pennock and Reeves, 2010)
+
+```text
+C(q) = 100 · b(q) · ln Σⱼ exp(qⱼ / b(q))        b(q) = α Σⱼ qⱼ        α = v / (n ln n)
+pᵢ   = ∂C/∂qᵢ = 100 · [ wᵢ + α H(w) ]           w = softmax(q / b)    H = Shannon entropy
+cost of a trade = C(q′) − C(q)    (+2% commission, 1 sat minimum on buys)
+```
+
+**Breeden-Litzenberger** (1978)
+
+```text
+f(K) = e^{rT} ∂²C/∂K²          P(a < S_T ≤ b) = ∫ₐᵇ f(K) dK
+```
+
+The smile is a weighted quadratic in standardised log-moneyness, continued in the wings as *linear total variance in log-moneyness* with the slope capped inside Roger Lee's bound `|dw/dk| < 2`. The density is floored at zero and renormalised with `np.trapezoid`, so the CDF is non-decreasing on `[0, 1]` by construction.
+
+**HAR realised variance** (Corsi, 2009), on Garman-Klass hourly bar variances, iterated forward to the market's expiry
+
+```text
+xₜ = ln RVₜ        xₜ₊₁ = c + β₁ xₜ + β₂ mean₂₄ₕ(x) + β₃ mean₁₆₈ₕ(x) + ε
+```
+
+**Sizing** — a contract bought at all-in price `c` pays `π = 100·(1 − fee)` with probability `p`:
+
+```text
+maximise over k:   k · p · π  −  [ C(q + k·eᵢ) − C(q) + commission(k) ]
+subject to:        net edge per contract ≥ 2.5 points,   expected gain ≥ 25 sats,
+                   cost ≤ 0.35 · κ · f* · bankroll,       f* = (p·π − c) / (π − c)
+                   cost ≤ 15% of equity per bucket,  35% per topic
+```
+
+`κ ∈ [0.25, 1]` is the model-disagreement multiplier.
+
+**Exits.** Positions are not held blindly to a binary settlement. Each tick: *take profit* when `P_market ≥ P_model − 1.0` and selling nets more than was paid; *invalidate* when `P_model` falls more than 4.0 points below the entry price.
+
+## Quickstart
+
+```bash
+git clone <this-repo> && cd glimpse-quant-bot
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+cp .env.example .env                                   # optional: defaults are safe
+```
+
+```bash
+glimpse-quant-bot demo-trades
+```
+
+That scans the live markets, prices the best mispricings on Glimpse's own estimate endpoint, paper-executes the survivors and writes `examples/sample_trades.md`. It needs no API key.
+
+```bash
+glimpse-quant-bot run --duration 3600
+```
+
+Runs the full stream-driven loop in paper mode for an hour, then prints the ledger.
+
+```bash
+glimpse-quant-bot backtest --synthetic
+```
+
+Optional TimesFM 2.5 (Apache-2.0, pulls in PyTorch): `pip install -e ".[timesfm]"`. Without it the time-series slot uses the NumPy GJR-GARCH model.
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+The ledger and recordings live on named volumes (`ledger`, `recordings`). `docker compose run --rm bot demo-trades` runs any other command; `docker compose --profile record up recorder` records the feed for a day.
+
+## CLI reference
+
+| Command | What it does | Places orders? |
+|---|---|---|
+| `run [--live] [--duration S]` | Stream-driven trading loop with reconnect | Only with `--live` **and** `GLIMPSE_LIVE_TRADING=true` |
+| `demo-trades [--max-trades N] [--out FILE]` | One-shot scan, server-priced ladders, paper fills, Markdown report | Never |
+| `record [--duration S] [--out DIR]` | Records the WebSocket feed (`MarketRecorder` NDJSON), spot, candles, metadata | Never |
+| `backtest --synthetic \| --data-dir DIR` | Walk-forward replay: Sharpe, Sortino, max drawdown, win rate, ROI | Never |
+| `report [--live] [--ledger FILE]` | Ledger summary and recent fills | Never |
+| `reconcile` | Aligns the live ledger with `portfolio_active()` (needs an API key) | Never |
+
+Every command accepts `--min-expected-gain-sats`, `--max-horizon-hours` and `--data-dir`. All settings are listed in [`.env.example`](.env.example).
+
+## Safety design
+
+- **Dry run is the default everywhere.** The client is built with `AsyncClient.from_env(dry_run=True)`, and the execution router additionally passes `dry_run` on every call, so a mis-constructed client still cannot trade.
+- **Two opt-ins for real money.** `--live` on the command line *and* `GLIMPSE_LIVE_TRADING=true` in the environment *and* an API key. `--live` without the others is an error, not a silent fallback.
+- **Zero blind retries.** Glimpse has no idempotency key. On `GlimpseAmbiguousTradeStateError` the bot locks trading, fetches `portfolio_active()`, diffs it against the append-only ledger, writes one adjustment row per difference, and only then unlocks. If the portfolio cannot be fetched it stays locked. The order is never resubmitted. `tests/test_risk_reconciler.py` proves the single-submission property with a counting fake exchange.
+- **Millisats and price points never mix.** Money is `Millisats`, quotes are `PriceUnits`, in separate fields and separate ledger columns; two named helpers are the only crossings.
+- **Hard guardrails.** 15% of equity per bucket, 35% per topic, a −6% intraday drawdown kill-switch (resets at 00:00 UTC), order-rate and re-entry limits, a time-to-expiry window. Exits are never blocked by the caps.
+- **Rate-limit discipline.** Decisions are driven by the WebSocket feed; one REST page per batch every 45 s refreshes 24 complete books; the client is throttled to 50 requests per minute against Glimpse's limit of 60.
+- **Commercially clean data.** Deribit, Binance, Coinbase and Kraken public endpoints only. No `yfinance`.
+- **Unit guard.** Ratio-quoted batches (gold in sats per ounce, WTI/BTC) are excluded: the models forecast USD prices.
+
+## Backtest
+
+`backtest --synthetic` builds a world with a known data-generating process: a driftless GBM underlying and twelve 3-hour topics whose market-maker quotes are *stale* (centred on the spot 45 minutes ago) and *too wide* (volatility ×1.5), converging to the truth by expiry. Fills are priced on the local LS-LMSR replica with all fees; the bot's own fills move the book.
+
+| Run | Net P&L | ROI | Entries / exits / settlements | Win rate | Max drawdown |
+|---|---:|---:|---:|---:|---:|
+| Mispriced, default 25-sat floor (seed 11) | +4,872 sats | +4.87% | 291 / 243 / 6 | 71.9% | 1.54% |
+| Mispriced, `--min-expected-gain-sats 20` (seed 11) | +5,001 sats | +5.00% | 296 / 244 / 6 | 70.4% | 1.58% |
+| Mispriced, seed 3 | +8,154 sats | +8.15% | 298 / 257 / 6 | 77.6% | 1.12% |
+| Mispriced, seed 29 | +8,028 sats | +8.03% | 309 / 255 / 9 | 76.1% | 1.69% |
+| **Control** — correctly priced market | 0 sats | 0.00% | 0 / 0 / 0 | – | 0.00% |
+
+Read this for what it is. The mispricing is put there by construction, so the table shows that the pipeline *harvests* an edge when one exists and *stands aside* when none does — not that live markets offer this edge. Annualised Sharpe figures from a 15-hour synthetic window (50–90) are printed by the tool but are not meaningful performance claims. A real answer needs `record` data over weeks.
+
+## Limitations
+
+- **The live order path is untested.** Everything up to the SDK call is covered by tests against a fake exchange, but no real order has been placed. `wallet_balance()` and the live exit response have no published schema and are parsed defensively.
+- **Settlement source.** The bot uses the median of Binance, Coinbase and Kraken as spot. Which venue Glimpse settles on is not documented; a few dollars of basis matters for $200 buckets near expiry.
+- **Risk-neutral is not physical.** The options density includes risk premia. It is one of three inputs for that reason.
+- **Recorded prices are rounded.** `MarketRecorder` stores 0–100 quotes, not share vectors, so replaying a recording reconstructs the book under an assumed depth (`GQB_BACKTEST_LIQUIDITY_B`).
+- **TimesFM path not exercised here** (PyTorch was not installed in development). The GJR-GARCH fallback is what was tested.
+- **Not low-latency in the HFT sense.** This is an asyncio Python process with millisecond-scale reaction times. Glimpse's market maker has no queue to race for, so that is the right tool; see ARCHITECTURE.md §9.
+- **SDK pagination.** The server ignores `page` / `page_size`, so `batch_active_markets_page` returns the 24 nearest-expiry markets per batch. The default 30-hour horizon fits inside that.
+
+## Design lineage
+
+Patterns were taken from open-source quant stacks on three continents; [`ARCHITECTURE.md`](ARCHITECTURE.md) documents each one and what was deliberately left out.
+
+| Ecosystem | Projects studied | What this bot adopted |
+|---|---|---|
+| United States | NautilusTrader, Hummingbot, LMSR market makers (Hanson; Othman et al.) | Backtest/live parity through shared components and an injected clock; inventory-aware budgets; an exact cost-function replica |
+| Europe | Deribit volatility-surface tooling, ccxt, vectorbt | Breeden-Litzenberger density from a smoothed smile; a uniform venue interface with failover; vectorised NumPy models |
+| China | vn.py (VeighNa), Microsoft Qlib | Strict one-way module pipeline; a pre-trade risk gatekeeper with flow control; a small factor layer feeding the model |
+
+## Repository layout
+
+```text
+src/glimpse_quant_bot/
+  config.py            validated settings, dry-run defaults, live-arming rule
+  types.py             Millisats/PriceUnits domain models, asset classifier
+  external_feeds.py    Deribit, Binance, Coinbase, Kraken with TTL cache and failover
+  options_density.py   smile fit, Lee-bounded wings, Breeden-Litzenberger density
+  forecaster.py        HAR-RV, GJR-GARCH, skewed-t, ensemble pooling
+  lmsr.py              exact local LS-LMSR cost function
+  lmsr_optimizer.py    slippage ladder, expected-profit maximiser, Kelly sizing, exit rules
+  risk_manager.py      caps, drawdown breaker, trading lock, reconciler
+  execution.py         the only module that calls trade-mutating SDK methods
+  ledger.py            append-only SQLite + NDJSON audit log
+  strategy.py          glimpse_markets.Strategy subclass for StrategyRunner
+  backtester.py        walk-forward replay and synthetic world
+  demo.py, cli.py      example-trades generator and command line
+tests/                 54 tests: density, pricer, optimiser, reconciler, replay
+examples/sample_trades.md
+```
+
+## Disclaimer
+
+This is research software. Event contracts on Glimpse are digital-asset derivatives; you can lose everything you put in, and they are not available in every jurisdiction. Nothing here is investment advice. Run it in paper mode until you have your own evidence.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
