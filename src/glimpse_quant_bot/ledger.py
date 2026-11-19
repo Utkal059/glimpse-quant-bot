@@ -446,6 +446,89 @@ class Ledger:
         selected = rows[-limit:] if limit is not None else rows
         return [self._to_record(row) for row in selected]
 
+    @staticmethod
+    def _filter(
+        mode: Mode | None, kinds: Sequence[RecordKind] | None
+    ) -> tuple[list[str], list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        if kinds:
+            clauses.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kind.value for kind in kinds)
+        return clauses, params
+
+    def page(
+        self,
+        mode: Mode | None = None,
+        kinds: Sequence[RecordKind] | None = None,
+        limit: int = 50,
+        before_id: int | None = None,
+    ) -> list[LedgerRecord]:
+        """Newest-first keyset page: at most ``limit`` rows with ``record_id < before_id``.
+
+        Read-only; used by the terminal so that paging a long ledger never loads
+        every row into memory.
+        """
+        clauses, params = self._filter(mode, kinds)
+        if before_id is not None:
+            clauses.append("record_id < ?")
+            params.append(before_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._db.execute(
+            f"SELECT * FROM records{where} ORDER BY record_id DESC LIMIT ?",
+            [*params, max(0, limit)],
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def records_after(
+        self,
+        after_id: int,
+        mode: Mode | None = None,
+        kinds: Sequence[RecordKind] | None = None,
+        limit: int = 200,
+    ) -> list[LedgerRecord]:
+        """Rows appended after ``after_id``, oldest first (incremental tailing)."""
+        clauses, params = self._filter(mode, kinds)
+        clauses.append("record_id > ?")
+        params.append(after_id)
+        rows = self._db.execute(
+            f"SELECT * FROM records WHERE {' AND '.join(clauses)} ORDER BY record_id LIMIT ?",
+            [*params, max(0, limit)],
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def count(self, mode: Mode | None = None, kinds: Sequence[RecordKind] | None = None) -> int:
+        clauses, params = self._filter(mode, kinds)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self._db.execute(f"SELECT COUNT(*) AS n FROM records{where}", params).fetchone()
+        return int(row["n"])
+
+    def last_record_id(self) -> int:
+        row = self._db.execute("SELECT COALESCE(MAX(record_id), 0) AS n FROM records").fetchone()
+        return int(row["n"])
+
+    def equity_curve(self, mode: Mode, limit: int = 5000) -> list[tuple[float, Millisats]]:
+        """``(ts, equity)`` from the periodic equity snapshots, oldest first."""
+        rows = self._db.execute(
+            "SELECT ts, payload FROM ("
+            " SELECT record_id, ts, payload FROM records WHERE mode = ? AND kind = ?"
+            " ORDER BY record_id DESC LIMIT ?"
+            ") ORDER BY record_id",
+            (mode, RecordKind.EQUITY.value, max(0, limit)),
+        ).fetchall()
+        curve: list[tuple[float, Millisats]] = []
+        for row in rows:
+            if row["payload"] is None:
+                continue
+            payload = json.loads(row["payload"])
+            equity = payload.get("equity_millisats")
+            if isinstance(equity, int):
+                curve.append((float(row["ts"]), Millisats(equity)))
+        return curve
+
     def payload(self, record_id: int) -> dict[str, Any]:
         row = self._db.execute(
             "SELECT payload FROM records WHERE record_id = ?", (record_id,)

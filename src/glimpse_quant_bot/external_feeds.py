@@ -59,6 +59,8 @@ class Candle:
     low: float
     close: float
     volume: float
+    taker_buy_volume: float | None = None
+    """Base volume bought by takers (Binance only); feeds the VPIN estimate."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +232,7 @@ class BinanceSpot(_Venue):
                 low=float(row[3]),
                 close=float(row[4]),
                 volume=float(row[5]),
+                taker_buy_volume=float(row[9]) if len(row) > 9 else None,
             )
             for row in rows
             if float(row[6]) < now_ms
@@ -570,17 +573,35 @@ class MarketDataHub:
             f"candles:{asset.value}:{interval_seconds}:{limit}", self.CANDLE_TTL, fetch
         )
 
-    async def orderbook_imbalance(self, asset: AssetType) -> float | None:
-        """L2 depth imbalance in ``[-1, 1]``, or ``None`` when no book is available."""
+    async def orderbook(self, asset: AssetType) -> OrderBook | None:
+        """Latest L2 snapshot from the first healthy venue, or ``None``."""
 
-        async def fetch() -> float:
-            book = await self._first(asset, "order book", lambda venue: venue.orderbook(asset))
-            return book.imbalance()
+        async def fetch() -> OrderBook:
+            return await self._first(asset, "order book", lambda venue: venue.orderbook(asset))
 
         try:
             return await self._cache.get(f"book:{asset.value}", self.BOOK_TTL, fetch)
         except FeedError:
             return None
+
+    async def orderbook_imbalance(self, asset: AssetType) -> float | None:
+        """L2 depth imbalance in ``[-1, 1]``, or ``None`` when no book is available."""
+        book = await self.orderbook(asset)
+        return None if book is None or not book.bids or not book.asks else book.imbalance()
+
+    async def flow_candles(self, asset: AssetType, limit: int = 1000) -> tuple[Candle, ...]:
+        """One-minute Binance bars with taker-buy volume (for VPIN); empty if unavailable."""
+        binance = next((v for v in self._venues if v.name == "binance" and v.supports(asset)), None)
+        if binance is None or not binance.healthy:
+            return ()
+
+        async def fetch() -> tuple[Candle, ...]:
+            return tuple(await self._call(binance, binance.candles(asset, 60, limit)))
+
+        try:
+            return await self._cache.get(f"flow:{asset.value}", self.CANDLE_TTL, fetch)
+        except FeedError:
+            return ()
 
     async def funding_rate(self, asset: AssetType) -> float | None:
         """Latest perpetual funding rate, or ``None`` when unavailable."""

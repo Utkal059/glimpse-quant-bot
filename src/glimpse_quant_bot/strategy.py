@@ -25,7 +25,7 @@ estimates per candidate that passes the local screen, 1 call per fill, and one
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +43,13 @@ from glimpse_markets.forecasting.signal import parse_bucket_name
 from glimpse_markets.models import BatchMarketItem, BatchMarketItemV2, MarketUpdateData
 from glimpse_markets.money import Millisats
 
+from glimpse_quant_bot.calibration import (
+    CalibrationView,
+    OnlineCalibrator,
+    PendingForecast,
+    calibration_prior,
+)
+from glimpse_quant_bot.coherence import cover_arbitrage, frank_wolfe_projection, linked_groups
 from glimpse_quant_bot.config import Settings
 from glimpse_quant_bot.execution import ExecutionRouter
 from glimpse_quant_bot.external_feeds import FeedError, MarketDataHub
@@ -59,11 +66,15 @@ from glimpse_quant_bot.lmsr_optimizer import (
     LocalEstimator,
     ServerEstimator,
     SlippageOptimizer,
+    basket_plan,
+    basket_plan_from_legs,
     evaluate_exit,
 )
 from glimpse_quant_bot.risk_manager import SHARE_TOLERANCE, RiskManager
+from glimpse_quant_bot.robust_kelly import optimize_basket
 from glimpse_quant_bot.types import (
     AssetType,
+    BasketPlan,
     Bucket,
     Mode,
     Position,
@@ -239,6 +250,18 @@ class GlimpseQuantStrategy(Strategy):
         self._round_robin = 0
         self._started = False
         self.fills = 0
+        self._calibrator = (
+            OnlineCalibrator(
+                prior=calibration_prior(settings),
+                eta=settings.calibration_eta,
+                share=settings.calibration_share,
+                min_resolved=settings.calibration_min_resolved,
+                path=settings.calibration_path,
+            )
+            if settings.enable_calibration
+            else None
+        )
+        self._resolution_polled: dict[str, float] = {}
 
     @property
     def ledger(self) -> Ledger:
@@ -393,12 +416,37 @@ class GlimpseQuantStrategy(Strategy):
 
     # --- entries ------------------------------------------------------------
 
+    def _calibration_view(self, topic: TopicMeta) -> CalibrationView | None:
+        if self._calibrator is None:
+            return None
+        return self._calibrator.view(OnlineCalibrator.key_for(topic.asset.value, topic.batch_id))
+
+    def _remember(self, topic: TopicMeta, forecast: EnsembleForecast, now: float) -> None:
+        """Keep the latest forecast made at least ``calibration_min_lead_seconds``
+        before expiry; it is scored when the topic resolves."""
+        if self._calibrator is None:
+            return
+        if topic.seconds_to_expiry(now) < self.settings.calibration_min_lead_seconds:
+            return
+        self._calibrator.record(
+            topic.topic_id,
+            PendingForecast(
+                key=OnlineCalibrator.key_for(topic.asset.value, topic.batch_id),
+                components=forecast.components,
+                pooled=forecast.probabilities,
+                option_ids=tuple(bucket.option_id for bucket in topic.buckets),
+                end_time_utc=topic.end_time_utc,
+                batch_id=topic.batch_id,
+            ),
+        )
+
     async def _forecast(self, topic: TopicMeta, now: float) -> EnsembleForecast:
         cached = self._forecasts.get(topic.topic_id)
         if cached is not None and now - cached.ts < FORECAST_REUSE_SECONDS:
             return cached
-        forecast = await self._forecaster.forecast(topic, now)
+        forecast = await self._forecaster.forecast(topic, now, self._calibration_view(topic))
         self._forecasts[topic.topic_id] = forecast
+        self._remember(topic, forecast, now)
         return forecast
 
     async def _evaluate(self, topic: TopicMeta, now: float) -> None:
@@ -412,8 +460,9 @@ class GlimpseQuantStrategy(Strategy):
         book = self.universe.books.get(topic.topic_id)
         if book is None:
             return
-        forecast = await self._forecaster.forecast(topic, now)
+        forecast = await self._forecaster.forecast(topic, now, self._calibration_view(topic))
         self._forecasts[topic.topic_id] = forecast
+        self._remember(topic, forecast, now)
         if not self._risk.entries_allowed:
             return
 
@@ -429,6 +478,10 @@ class GlimpseQuantStrategy(Strategy):
         positions = await self._open_positions(now)
         cash = self._cash()
         equity = Millisats(int(cash) + int(self._positions_value(positions)))
+        if settings.enable_basket_entries and await self._try_basket(
+            topic, book, forecast, equity, cash, positions, now
+        ):
+            return
         for signal in candidates:
             budget = self._risk.entry_budget(
                 signal.topic_id, signal.option_id, equity, cash, positions
@@ -441,6 +494,7 @@ class GlimpseQuantStrategy(Strategy):
                 bankroll=equity,
                 max_cost=budget,
                 kelly_multiplier=forecast.kelly_multiplier,
+                ambiguity=forecast.ambiguity,
             )
             if result.plan is None:
                 log.debug(
@@ -466,6 +520,77 @@ class GlimpseQuantStrategy(Strategy):
             if await self._router.enter(plan) is not None:
                 self.fills += 1
                 break
+
+    async def _try_basket(
+        self,
+        topic: TopicMeta,
+        book: LmsrBook,
+        forecast: EnsembleForecast,
+        equity: Millisats,
+        cash: Millisats,
+        positions: dict[PositionKey, Position],
+        now: float,
+    ) -> bool:
+        """Robust-Kelly corridor basket on one topic; ``True`` if one was sent."""
+        settings = self.settings
+        if self._router is None:
+            return False
+        held_in_topic = sum(
+            int(p.cost_basis_millisats)
+            for (tid, _), p in positions.items()
+            if tid == topic.topic_id
+        )
+        room = min(int(int(equity) * settings.max_topic_fraction) - held_in_topic, int(cash))
+        solution = optimize_basket(
+            book,
+            forecast.probabilities,
+            sub_bankroll_points=int(equity)
+            / 1000.0
+            * settings.kelly_fraction
+            * forecast.kelly_multiplier,
+            max_cost_points=room / 1000.0 / (1.0 + settings.fee_rate),
+            fee_rate=settings.fee_rate,
+            ambiguity=forecast.ambiguity,
+            max_legs=settings.basket_max_legs,
+            min_leg_contracts=settings.basket_min_leg_contracts,
+            max_leg_contracts=settings.ladder_max_contracts,
+        )
+        if solution is None or len(solution.legs) < 2:
+            return False
+        names = {bucket.option_id: bucket.name for bucket in topic.buckets}
+        quote = await ServerEstimator(self.client).quote_buy(topic.topic_id, solution.leg_tuples)
+        plan = basket_plan(
+            solution,
+            names,
+            settings,
+            cost_millisats=quote.amount_millisats,
+            commission_millisats=quote.commission_millisats,
+        )
+        self._ledger.record_event(
+            self.mode,
+            RecordKind.ESTIMATE,
+            plan.rationale,
+            payload={
+                "legs": [[leg.option_id, leg.contracts] for leg in plan.legs],
+                "cost_millisats": int(plan.cost_millisats),
+                "commission_millisats": int(plan.commission_millisats),
+                "expected_profit_millisats": int(plan.expected_profit_millisats),
+                "ambiguity": forecast.ambiguity,
+            },
+            topic_id=topic.topic_id,
+        )
+        decision = self._risk.check_basket(plan, topic, equity, cash, positions, now)
+        if not decision.approved:
+            self._ledger.record_event(
+                self.mode,
+                RecordKind.RISK_EVENT,
+                "basket blocked: " + "; ".join(decision.reasons),
+                topic_id=topic.topic_id,
+            )
+            return False
+        records = await self._router.enter_baskets([plan])
+        self.fills += len(records)
+        return bool(records)
 
     async def _evaluate_round_robin(self, now: float) -> None:
         topics = sorted(self.universe.topics.values(), key=lambda topic: topic.end_time_utc)
@@ -572,6 +697,111 @@ class GlimpseQuantStrategy(Strategy):
         if self.mode == "live":
             await self._poll_wallet()
         await self._settle_resolved(now)
+        await self._guarded("calibration", self._resolve_calibration(now))
+        await self._guarded("coherence", self._scan_coherence(now))
+
+    async def _resolve_calibration(self, now: float) -> None:
+        """Score pending forecasts of resolved topics (one page per batch, at
+        most every ``calibration_poll_seconds``)."""
+        calibrator = self._calibrator
+        if calibrator is None:
+            return
+        calibrator.expire(now)
+        due: dict[str, set[int]] = {}
+        for topic_id, pending in calibrator.pending.items():
+            if pending.end_time_utc <= now:
+                due.setdefault(pending.batch_id, set()).add(topic_id)
+        updated = False
+        poll = self.settings.calibration_poll_seconds
+        for batch_id, topic_ids in due.items():
+            if now - self._resolution_polled.get(batch_id, 0.0) < poll:
+                continue
+            self._resolution_polled[batch_id] = now
+            page = await self.client.batch_resolved_markets_page(batch_id)
+            for market in page.markets or []:
+                if market.topic_id not in topic_ids or market.resolved_option_id is None:
+                    continue
+                scores = calibrator.resolve(market.topic_id, market.resolved_option_id)
+                if scores is not None:
+                    updated = True
+                    log.info("calibration.scored", topic_id=market.topic_id, brier=scores)
+        if updated:
+            calibrator.save()
+
+    async def _scan_coherence(self, now: float) -> None:
+        """Bregman-project linked books; log and (optionally) take a buy-only cover."""
+        for group in linked_groups(self.universe.topics):
+            topics = [self.universe.topics[t] for t in group if t in self.universe.books]
+            if len(topics) < 2:
+                continue
+            if topics[0].seconds_to_expiry(now) < self.settings.min_seconds_to_expiry:
+                continue
+            books = [self.universe.books[topic.topic_id] for topic in topics]
+            projection = frank_wolfe_projection(topics, books)
+            arbitrage = cover_arbitrage(
+                topics,
+                books,
+                fee_rate=self.settings.fee_rate,
+                max_cost_points=int(self._cash()) / 1000.0 * self.settings.max_topic_fraction,
+            )
+            log.info(
+                "coherence.scan",
+                topics=group,
+                divergence_sats=round(projection.divergence_points, 3),
+                fw_gap=projection.gap,
+                cover_profit_sats=None
+                if arbitrage is None
+                else round(arbitrage.guaranteed_profit_points, 2),
+            )
+            if arbitrage is None:
+                continue
+            self._ledger.record_event(
+                self.mode,
+                RecordKind.SIGNAL,
+                f"cross-topic cover: guaranteed {arbitrage.guaranteed_profit_points:.1f} sats "
+                f"for {arbitrage.all_in_points:.1f} sats all-in",
+                payload={
+                    "legs": {str(k): [list(leg) for leg in v] for k, v in arbitrage.legs.items()},
+                    "unit_cost_points": arbitrage.unit_cost_points,
+                    "divergence_points": projection.divergence_points,
+                },
+            )
+            if self.settings.enable_cross_topic_arbitrage and self._risk.entries_allowed:
+                await self._execute_cover(arbitrage.legs, now)
+
+    async def _execute_cover(
+        self, legs: Mapping[int, tuple[tuple[int, float], ...]], now: float
+    ) -> None:
+        if self._router is None:
+            return
+        positions = await self._open_positions(now)
+        cash = self._cash()
+        equity = Millisats(int(cash) + int(self._positions_value(positions)))
+        baskets: list[BasketPlan] = []
+        for topic_id, topic_legs in legs.items():
+            topic = self.universe.topics[topic_id]
+            book = self.universe.books[topic_id]
+            forecast = self._forecasts.get(topic_id)
+            probabilities = (
+                forecast.probabilities
+                if forecast is not None
+                else dict(zip(book.option_ids, book.probabilities().tolist(), strict=True))
+            )
+            names = {bucket.option_id: bucket.name for bucket in topic.buckets}
+            plan = basket_plan_from_legs(book, topic_legs, probabilities, names, self.settings)
+            decision = self._risk.check_basket(
+                plan, topic, equity, cash, positions, now, require_gain=False
+            )
+            if not decision.approved:
+                self._ledger.record_event(
+                    self.mode,
+                    RecordKind.RISK_EVENT,
+                    "cover blocked: " + "; ".join(decision.reasons),
+                    topic_id=topic_id,
+                )
+                return
+            baskets.append(plan)
+        self.fills += len(await self._router.enter_baskets(baskets))
 
     async def _settle_resolved(self, now: float) -> None:
         """Detect resolution via ``quote_mode`` and book the binary settlement."""

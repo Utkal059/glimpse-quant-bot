@@ -82,6 +82,36 @@ class Settings(BaseSettings):
     enable_timesfm: bool = True
     enable_spot_websocket: bool = True
 
+    # --- P vs Q pricing kernel (pricing_kernel.py) --------------------------
+    # f_P(k) = f_Q(k) exp(gamma k - xi_a(k) k^2) / Z, xi fitted so that
+    # Var_P = Var_HAR^blend * (Var_Q / prior_ratio)^(1 - blend), clipped to
+    # Var_Q / Var_P in [1, kernel_max_ratio].
+    enable_pricing_kernel: bool = True
+    kernel_blend: float = Field(default=0.5, ge=0, le=1)
+    kernel_prior_ratio: float = Field(default=1.25, ge=1, le=3)
+    kernel_asymmetry: float = Field(default=0.3, ge=0, le=0.9)
+    kernel_max_ratio: float = Field(default=3.0, ge=1, le=10)
+    physical_drift_annual: float = Field(default=0.0, ge=-2, le=2)
+
+    # --- Order flow and toxicity (flow_toxicity.py) -------------------------
+    enable_flow_signals: bool = True
+    ofi_levels: int = Field(default=5, ge=1, le=20)
+    ofi_min_obs: int = Field(default=20, ge=5)
+    ofi_drift_cap_sigmas: float = Field(default=0.25, ge=0, le=1)
+    vpin_bucket_minutes: float = Field(default=10.0, gt=0)
+    vpin_window: int = Field(default=20, ge=5)
+    toxicity_threshold: float = Field(default=0.8, ge=0.5, lt=1)
+    toxicity_tail_kappa: float = Field(default=1.0, ge=0, le=5)
+    toxicity_variance_kappa: float = Field(default=0.15, ge=0, le=0.5)
+
+    # --- Online calibration (calibration.py) --------------------------------
+    enable_calibration: bool = True
+    calibration_eta: float = Field(default=0.25, gt=0, le=0.25)
+    calibration_share: float = Field(default=0.02, ge=0, le=0.5)
+    calibration_min_resolved: int = Field(default=20, ge=1)
+    calibration_min_lead_seconds: float = Field(default=600.0, ge=0)
+    calibration_poll_seconds: float = Field(default=300.0, ge=30)
+
     # --- Signal & execution thresholds (0-100 price points) -----------------
     min_raw_edge_points: float = Field(default=3.0, ge=0)
     min_net_edge_points: float = Field(default=2.5, ge=0)
@@ -102,6 +132,16 @@ class Settings(BaseSettings):
     # --- Sizing & portfolio guardrails --------------------------------------
     kelly_fraction: float = Field(default=0.35, gt=0, le=1)
     kelly_disagreement_floor: float = Field(default=0.25, gt=0, le=1)
+    # KL-robust Kelly: the stake is Kelly at the KL lower bound p_lo(eps),
+    # eps = ambiguity_floor + ambiguity_per_jsd * JSD(components) in nats.
+    ambiguity_floor: float = Field(default=2.0e-4, ge=0, le=0.05)
+    ambiguity_per_jsd: float = Field(default=0.0, ge=0, le=1)
+    # Multi-leg corridor baskets and cross-topic cover arbitrage. Off by
+    # default: both send multi-leg orders and should be paper-traded first.
+    enable_basket_entries: bool = False
+    basket_max_legs: int = Field(default=12, ge=2, le=40)
+    basket_min_leg_contracts: float = Field(default=1.0, gt=0)
+    enable_cross_topic_arbitrage: bool = False
     max_bucket_fraction: float = Field(default=0.15, gt=0, le=1)
     max_topic_fraction: float = Field(default=0.35, gt=0, le=1)
     daily_drawdown_limit: float = Field(default=0.06, gt=0, lt=1)
@@ -180,6 +220,10 @@ class Settings(BaseSettings):
     @property
     def audit_path(self) -> Path:
         return self.data_dir / "audit.ndjson"
+
+    @property
+    def calibration_path(self) -> Path:
+        return self.data_dir / "calibration.json"
 
     @property
     def recordings_dir(self) -> Path:

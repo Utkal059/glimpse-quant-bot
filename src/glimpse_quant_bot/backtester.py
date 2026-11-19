@@ -43,6 +43,7 @@ import numpy as np
 from glimpse_markets.forecasting.recorder import MarketRecorder
 from glimpse_markets.money import Millisats
 
+from glimpse_quant_bot.calibration import OnlineCalibrator, PendingForecast, calibration_prior
 from glimpse_quant_bot.config import Settings
 from glimpse_quant_bot.external_feeds import Candle
 from glimpse_quant_bot.forecaster import (
@@ -342,6 +343,16 @@ class Backtester:
         latest: dict[int, dict[int, float]] = {tid: {} for tid in opens}
         slow_fits: dict[AssetType, SlowFit] = {}
         equity_curve: list[tuple[int, int]] = []
+        calibrator = (
+            OnlineCalibrator(
+                prior=calibration_prior(settings),
+                eta=settings.calibration_eta,
+                share=settings.calibration_share,
+                min_resolved=settings.calibration_min_resolved,
+            )
+            if settings.enable_calibration
+            else None
+        )
 
         for ts in range(start, end + self._step, self._step):
             self._now = float(ts)
@@ -361,6 +372,15 @@ class Backtester:
                     note=f"resolved to option {winner}",
                 )
             positions = ledger.positions(self._mode)
+            if calibrator is not None:
+                for topic_id in [
+                    tid for tid, pending in calibrator.pending.items() if pending.end_time_utc <= ts
+                ]:
+                    winner = self._winner(data.topics[topic_id])
+                    if winner is None:
+                        calibrator.pending.pop(topic_id, None)
+                    else:
+                        calibrator.resolve(topic_id, winner)
 
             # 2. Rebuild each active book from the recording plus our own fills.
             books.clear()
@@ -401,10 +421,27 @@ class Backtester:
                 if slow is None or spot is None:
                     continue
                 fast = FastInputs(spot, None, None, None, ("recording",), float(ts))
+                key = OnlineCalibrator.key_for(meta.asset.value, meta.batch_id)
+                view = calibrator.view(key) if calibrator is not None else None
                 try:
-                    forecast = build_forecast(meta, slow, fast, float(ts), settings)
+                    forecast = build_forecast(meta, slow, fast, float(ts), settings, view)
                 except ForecastError:
                     continue
+                if (
+                    calibrator is not None
+                    and meta.seconds_to_expiry(float(ts)) >= settings.calibration_min_lead_seconds
+                ):
+                    calibrator.record(
+                        topic_id,
+                        PendingForecast(
+                            key=key,
+                            components=forecast.components,
+                            pooled=forecast.probabilities,
+                            option_ids=tuple(bucket.option_id for bucket in meta.buckets),
+                            end_time_utc=meta.end_time_utc,
+                            batch_id=meta.batch_id,
+                        ),
+                    )
                 book = books[topic_id]
 
                 for (held_topic, option_id), position in ledger.positions(self._mode).items():
@@ -457,6 +494,7 @@ class Backtester:
                         bankroll=equity,
                         max_cost=budget,
                         kelly_multiplier=forecast.kelly_multiplier,
+                        ambiguity=forecast.ambiguity,
                     )
                     plan = result.plan
                     if plan is None:

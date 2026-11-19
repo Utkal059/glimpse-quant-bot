@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -43,7 +43,15 @@ from glimpse_markets.money import Millisats
 
 from glimpse_quant_bot.config import Settings
 from glimpse_quant_bot.ledger import Ledger, PositionKey
-from glimpse_quant_bot.types import Mode, Position, RecordKind, Side, TopicMeta, TradePlan
+from glimpse_quant_bot.types import (
+    BasketPlan,
+    Mode,
+    Position,
+    RecordKind,
+    Side,
+    TopicMeta,
+    TradePlan,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -84,6 +92,15 @@ class Discrepancy:
     @property
     def delta(self) -> float:
         return self.actual_contracts - self.ledger_contracts
+
+
+@dataclass(frozen=True, slots=True)
+class BreakerState:
+    """The drawdown breaker's memory for one UTC day (see :meth:`RiskManager.breaker_state`)."""
+
+    day: str | None
+    day_peak_millisats: Millisats
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +210,29 @@ class RiskManager:
         self._day_peak = 0
         self._day = None
 
+    def breaker_state(self) -> BreakerState:
+        """Snapshot of the day's peak and breaker, to carry across a restart."""
+        return BreakerState(self._day, Millisats(self._day_peak), self._breaker_reason)
+
+    def restore_breaker(self, state: BreakerState, now: float | None = None) -> bool:
+        """Re-apply a snapshot taken earlier the same UTC day.
+
+        A process that stops and starts again within one day must not get a
+        fresh peak (and an untripped breaker) for free. Snapshots from an
+        earlier day are ignored, exactly as :meth:`update_equity` would reset
+        them. Returns ``True`` if the snapshot was applied.
+        """
+        moment = self._clock() if now is None else now
+        today = datetime.fromtimestamp(moment, tz=UTC).strftime("%Y-%m-%d")
+        if state.day != today:
+            return False
+        self._day = state.day
+        self._day_peak = max(self._day_peak, int(state.day_peak_millisats))
+        if state.reason is not None and self._breaker_reason is None:
+            self._breaker_reason = state.reason
+            log.warning("risk.breaker_restored", reason=state.reason)
+        return True
+
     @property
     def entries_allowed(self) -> bool:
         return not self.locked and not self.breaker_tripped
@@ -228,8 +268,14 @@ class RiskManager:
         cash: Millisats,
         positions: Mapping[PositionKey, Position],
         now: float | None = None,
+        *,
+        per_trade_thresholds: bool = True,
     ) -> RiskDecision:
-        """Final go/no-go for an entry. Every failed rule is reported."""
+        """Final go/no-go for an entry. Every failed rule is reported.
+
+        ``per_trade_thresholds=False`` skips the net-edge and expected-gain rules
+        (a basket leg is judged by the basket's total, see :meth:`check_basket`).
+        """
         settings = self._settings
         moment = self._clock() if now is None else now
         reasons: list[str] = []
@@ -258,10 +304,11 @@ class RiskManager:
                 f"cost {int(plan.all_in_millisats) / 1000:.0f} sats exceeds the remaining "
                 f"bucket/topic/cash budget of {int(budget) / 1000:.0f} sats"
             )
-        if float(plan.net_edge_points) < settings.min_net_edge_points:
-            reasons.append("net edge below threshold")
-        if int(plan.expected_profit_millisats) < int(settings.min_expected_gain_millisats):
-            reasons.append("expected gain below threshold")
+        if per_trade_thresholds:
+            if float(plan.net_edge_points) < settings.min_net_edge_points:
+                reasons.append("net edge below threshold")
+            if int(plan.expected_profit_millisats) < int(settings.min_expected_gain_millisats):
+                reasons.append("expected gain below threshold")
         if key not in positions and len(positions) >= settings.max_open_positions:
             reasons.append(f"{len(positions)} open positions is the maximum")
 
@@ -278,18 +325,67 @@ class RiskManager:
             log.info("risk.entry_rejected", topic_id=plan.topic_id, reasons=reasons)
         return decision
 
+    def check_basket(
+        self,
+        basket: BasketPlan,
+        topic: TopicMeta,
+        equity: Millisats,
+        cash: Millisats,
+        positions: Mapping[PositionKey, Position],
+        now: float | None = None,
+        *,
+        require_gain: bool = True,
+    ) -> RiskDecision:
+        """Every leg against every cap, legs accumulated as they would be held;
+        the gain threshold applies to the basket as a whole (``require_gain=False``
+        for one topic's group of a cross-topic cover, whose profit is joint)."""
+        held: dict[PositionKey, Position] = dict(positions)
+        reasons: list[str] = []
+        for leg in basket.legs:
+            decision = self.check_entry(
+                leg, topic, equity, cash, held, now, per_trade_thresholds=False
+            )
+            reasons.extend(f"{leg.bucket_name}: {reason}" for reason in decision.reasons)
+            key = (leg.topic_id, leg.option_id)
+            previous = held.get(key)
+            held[key] = Position(
+                topic_id=leg.topic_id,
+                option_id=leg.option_id,
+                bucket_name=leg.bucket_name,
+                contracts=leg.contracts + (previous.contracts if previous else 0.0),
+                cost_basis_millisats=Millisats(
+                    int(leg.all_in_millisats)
+                    + (int(previous.cost_basis_millisats) if previous else 0)
+                ),
+                entry_model_probability=leg.model_probability,
+            )
+            cash = Millisats(int(cash) - int(leg.all_in_millisats))
+        if require_gain and int(basket.expected_profit_millisats) < int(
+            self._settings.min_expected_gain_millisats
+        ):
+            reasons.append("basket expected gain below threshold")
+        unique = tuple(dict.fromkeys(reasons))
+        return RiskDecision(approved=not unique, reasons=unique)
+
     def note_order(self, topic_id: int, option_id: int, now: float | None = None) -> None:
         """Record that an order was sent (feeds the flow-control rules)."""
         moment = self._clock() if now is None else now
         self._order_times.append(moment)
         self._last_order[(topic_id, option_id)] = moment
 
+    def note_basket(self, keys: Collection[PositionKey], now: float | None = None) -> None:
+        """One order (one request) that touched several buckets."""
+        moment = self._clock() if now is None else now
+        self._order_times.append(moment)
+        for key in keys:
+            self._last_order[key] = moment
+
     # --- reconciliation -----------------------------------------------------
 
     async def reconcile(
         self,
         source: PortfolioSource,
-        intent: TradeIntent | None = None,
+        intent: TradeIntent | Sequence[TradeIntent] | None = None,
         skip_topics: Collection[int] = (),
     ) -> ReconcileReport:
         """Align the ledger with the exchange's open positions.
@@ -320,7 +416,13 @@ class RiskManager:
             names[key] = item.option_name or names.get(key, "")
 
         expected = self._ledger.positions(self._mode)
-        intent_key = (intent.topic_id, intent.option_id) if intent is not None else None
+        if intent is None:
+            intents: list[TradeIntent] = []
+        elif isinstance(intent, TradeIntent):
+            intents = [intent]
+        else:
+            intents = list(intent)
+        by_key = {(i.topic_id, i.option_id): i for i in intents}
         discrepancies: list[Discrepancy] = []
         for key in sorted(set(actual) | set(expected)):
             if key[0] in skip_topics:
@@ -332,11 +434,12 @@ class RiskManager:
                 continue
             discrepancies.append(Discrepancy(key[0], key[1], ledger_contracts, actual_contracts))
             cash_flow = Millisats(0)
-            if intent is not None and key == intent_key and intent.contracts > 0:
-                signed = intent.contracts if intent.side is Side.BUY else -intent.contracts
+            matched = by_key.get(key)
+            if matched is not None and matched.contracts > 0:
+                signed = matched.contracts if matched.side is Side.BUY else -matched.contracts
                 if delta * signed > 0:
-                    share = min(1.0, abs(delta) / intent.contracts)
-                    cash_flow = Millisats(round(int(intent.expected_cash_flow_millisats) * share))
+                    share = min(1.0, abs(delta) / matched.contracts)
+                    cash_flow = Millisats(round(int(matched.expected_cash_flow_millisats) * share))
             bucket_name = names.get(key) or (expected[key].bucket_name if key in expected else "")
             self._ledger.record_adjustment(
                 self._mode,
@@ -352,17 +455,28 @@ class RiskManager:
             )
 
         landed: bool | None = None
-        if intent is not None and intent_key is not None:
-            signed = intent.contracts if intent.side is Side.BUY else -intent.contracts
-            match = next(
-                (d for d in discrepancies if (d.topic_id, d.option_id) == intent_key), None
-            )
-            landed = match is not None and match.delta * signed > 0
+        if intents:
+            outcomes = []
+            for planned in intents:
+                signed = planned.contracts if planned.side is Side.BUY else -planned.contracts
+                match = next(
+                    (
+                        d
+                        for d in discrepancies
+                        if (d.topic_id, d.option_id) == (planned.topic_id, planned.option_id)
+                    ),
+                    None,
+                )
+                outcomes.append(match is not None and match.delta * signed > 0)
+            landed = all(outcomes)
 
+        first = intents[0] if intents else None
         note = f"{len(discrepancies)} discrepancy(ies) adjusted" + (
             ""
-            if intent is None
-            else f"; ambiguous {intent.side.value} {'executed' if landed else 'did not execute'}"
+            if first is None
+            else f"; ambiguous {first.side.value} "
+            f"{'executed' if landed else 'did not (fully) execute'}"
+            + (f" ({len(intents)} legs)" if len(intents) > 1 else "")
         )
         log.warning(
             "risk.reconciled",
@@ -393,8 +507,8 @@ class RiskManager:
                     for d in discrepancies
                 ],
             },
-            topic_id=None if intent is None else intent.topic_id,
-            option_id=None if intent is None else intent.option_id,
+            topic_id=None if first is None else first.topic_id,
+            option_id=None if first is None else first.option_id,
         )
         self.unlock(f"reconciliation complete: {note}")
         return ReconcileReport(

@@ -20,7 +20,8 @@ server's own book, and the final decision is taken on server numbers only.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -29,14 +30,22 @@ from glimpse_markets.money import Millisats, PriceUnits
 
 from glimpse_quant_bot.config import Settings
 from glimpse_quant_bot.lmsr import (
+    MILLISATS_PER_POINT,
     Leg,
     LmsrBook,
     buy_commission,
     max_contracts_below_price,
     sell_commission,
 )
+from glimpse_quant_bot.robust_kelly import (
+    BasketLeg,
+    BasketSolution,
+    aumann_shapley_costs,
+    robust_kelly_fraction,
+)
 from glimpse_quant_bot.types import (
     PAYOUT_PRICE,
+    BasketPlan,
     BucketSignal,
     LadderPoint,
     Position,
@@ -243,18 +252,33 @@ class SlippageOptimizer:
         max_cost: Millisats,
         kelly_multiplier: float = 1.0,
         full_server_ladder: bool = False,
+        ambiguity: float = 0.0,
     ) -> OptimizationResult:
+        """``ambiguity`` is the KL radius ``eps``: the Kelly fraction is evaluated at
+        the KL lower confidence bound ``p_lo(eps)`` (exact worst case; see
+        :mod:`glimpse_quant_bot.robust_kelly`). ``0`` reproduces plain Kelly."""
         settings = self._settings
         probability = signal.model_probability
         if float(signal.edge_points) < settings.min_raw_edge_points:
             return OptimizationResult(None, (), (), "raw edge below threshold")
 
         marginal_all_in = PriceUnits(float(signal.market_price) * (1.0 + settings.fee_rate))
-        full_kelly = kelly_fraction(probability, marginal_all_in, settings.fee_rate)
+        if ambiguity > 0.0:
+            payout = float(PAYOUT_PRICE) * (1.0 - settings.fee_rate)
+            full_kelly = robust_kelly_fraction(
+                probability, float(marginal_all_in), payout, ambiguity
+            )
+        else:
+            full_kelly = kelly_fraction(probability, marginal_all_in, settings.fee_rate)
         fraction = settings.kelly_fraction * kelly_multiplier * full_kelly
         budget = Millisats(min(int(max_cost), int(int(bankroll) * fraction)))
         if int(budget) <= 0:
-            return OptimizationResult(None, (), (), "no Kelly or risk budget for this bucket")
+            reason = (
+                "edge is not robust to the model's KL ambiguity"
+                if ambiguity > 0.0 and full_kelly <= 0.0
+                else "no Kelly or risk budget for this bucket"
+            )
+            return OptimizationResult(None, (), (), reason)
 
         sizes = self.candidate_sizes(signal, book)
         local_points: list[LadderPoint] = []
@@ -367,3 +391,119 @@ def evaluate_exit(
             f"{int(position.cost_basis_millisats) / 1000:.1f} sats",
         )
     return ExitDecision(False, "hold", "edge remains")
+
+
+def basket_plan(
+    solution: BasketSolution,
+    names: Mapping[int, str],
+    settings: Settings,
+    *,
+    cost_millisats: Millisats | None = None,
+    commission_millisats: Millisats | None = None,
+) -> BasketPlan:
+    """Turn a :class:`BasketSolution` into per-leg :class:`TradePlan` objects.
+
+    Leg costs are the Aumann-Shapley shares of the basket cost (exact additive
+    split of ``C(q + delta) - C(q)``); commission is split in proportion. When
+    the server quoted the basket (``cost_millisats`` / ``commission_millisats``),
+    its totals replace the local ones and the shares are rescaled to match.
+    """
+    local_cost = sum(leg.cost_points for leg in solution.legs)
+    total_cost = (
+        int(cost_millisats)
+        if cost_millisats is not None
+        else round(solution.cost_points * MILLISATS_PER_POINT)
+    )
+    total_commission = (
+        int(commission_millisats)
+        if commission_millisats is not None
+        else round(solution.commission_points * MILLISATS_PER_POINT)
+    )
+    fair_total = 0
+    legs: list[TradePlan] = []
+    allocated_cost = allocated_commission = 0
+    for index, leg in enumerate(solution.legs):
+        last = index == len(solution.legs) - 1
+        share = leg.cost_points / local_cost if local_cost > 0.0 else 1.0 / len(solution.legs)
+        leg_cost = total_cost - allocated_cost if last else round(total_cost * share)
+        leg_commission = (
+            total_commission - allocated_commission if last else round(total_commission * share)
+        )
+        allocated_cost += leg_cost
+        allocated_commission += leg_commission
+        quote = CostQuote(Millisats(leg_cost), Millisats(leg_commission), "local")
+        point = ladder_point(leg.contracts, quote, leg.model_probability, settings.fee_rate)
+        fair_total += int(point.expected_profit_millisats) + leg_cost + leg_commission
+        legs.append(
+            TradePlan(
+                topic_id=solution.topic_id,
+                option_id=leg.option_id,
+                bucket_name=names.get(leg.option_id, str(leg.option_id)),
+                side=Side.BUY,
+                contracts=leg.contracts,
+                cost_millisats=point.cost_millisats,
+                commission_millisats=point.commission_millisats,
+                exec_price=point.exec_price,
+                market_price=PriceUnits(leg.market_price),
+                model_probability=leg.model_probability,
+                net_edge_points=point.net_edge_points,
+                expected_profit_millisats=point.expected_profit_millisats,
+                kelly_fraction=0.0,
+                budget_millisats=Millisats(
+                    round(solution.sub_bankroll_points * MILLISATS_PER_POINT)
+                ),
+                ladder=(point,),
+                rationale=f"leg of a {len(solution.legs)}-leg robust-Kelly basket",
+            )
+        )
+    expected = fair_total - total_cost - total_commission
+    return BasketPlan(
+        topic_id=solution.topic_id,
+        legs=tuple(legs),
+        cost_millisats=Millisats(total_cost),
+        commission_millisats=Millisats(total_commission),
+        expected_profit_millisats=Millisats(expected),
+        robust_growth=solution.robust_growth,
+        rationale=(
+            f"{len(legs)}-leg basket, worst-case log growth {solution.robust_growth:.2e} "
+            f"(nominal {solution.nominal_growth:.2e}, lambda* {solution.worst_case_lambda:.3g})"
+        ),
+    )
+
+
+def basket_plan_from_legs(
+    book: LmsrBook,
+    legs: Sequence[Leg],
+    probabilities: Mapping[int, float],
+    names: Mapping[int, str],
+    settings: Settings,
+) -> BasketPlan:
+    """Price fixed legs on the local replica (e.g. a cover-arbitrage group)."""
+    fee = settings.fee_rate
+    prices = book.prices()
+    shares = aumann_shapley_costs(book, legs)
+    raw = float(shares.sum())
+    commission = max(settings.min_buy_commission_millisats / MILLISATS_PER_POINT, fee * raw)
+    pi = float(PAYOUT_PRICE) * (1.0 - fee)
+    expected = sum(pi * probabilities.get(o, 0.0) * k for o, k in legs) - raw - commission
+    solution = BasketSolution(
+        topic_id=book.topic_id,
+        legs=tuple(
+            BasketLeg(
+                option_id=option_id,
+                contracts=contracts,
+                model_probability=probabilities.get(option_id, 0.0),
+                market_price=float(prices[book.index_of(option_id)]),
+                cost_points=float(share),
+            )
+            for (option_id, contracts), share in zip(legs, shares, strict=True)
+        ),
+        cost_points=raw,
+        commission_points=commission,
+        expected_profit_points=expected,
+        robust_growth=0.0,
+        nominal_growth=0.0,
+        worst_case_lambda=math.inf,
+        sub_bankroll_points=0.0,
+    )
+    return basket_plan(solution, names, settings)

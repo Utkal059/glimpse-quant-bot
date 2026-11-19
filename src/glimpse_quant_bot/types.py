@@ -198,6 +198,33 @@ class TradePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class BasketPlan:
+    """A multi-leg buy on one topic: one group of ``enter_multi_topic_multi_leg``.
+
+    Each leg is a full :class:`TradePlan` whose cost is its Aumann-Shapley share
+    of the basket's LS-LMSR cost, so the ledger and risk rules treat legs as
+    ordinary positions while the basket is priced and sent as one order.
+    """
+
+    topic_id: int
+    legs: tuple[TradePlan, ...]
+    cost_millisats: Millisats
+    commission_millisats: Millisats
+    expected_profit_millisats: Millisats
+    robust_growth: float
+    """Worst-case expected log growth of the Kelly sub-bankroll."""
+    rationale: str
+
+    @property
+    def all_in_millisats(self) -> Millisats:
+        return Millisats(int(self.cost_millisats) + int(self.commission_millisats))
+
+    @property
+    def leg_tuples(self) -> list[tuple[int, float]]:
+        return [(leg.option_id, leg.contracts) for leg in self.legs]
+
+
+@dataclass(frozen=True, slots=True)
 class Position:
     """An open long position in one bucket."""
 

@@ -49,8 +49,18 @@ from glimpse_markets.money import PriceUnits
 from scipy.optimize import minimize
 from scipy.special import gammaln, stdtr
 
+from glimpse_quant_bot.calibration import CalibrationView, apply_temperature
 from glimpse_quant_bot.config import Settings
 from glimpse_quant_bot.external_feeds import Candle, MarketDataHub
+from glimpse_quant_bot.flow_toxicity import (
+    FlowSignal,
+    OfiTracker,
+    book_levels,
+    ofi_drift,
+    toxic_tail_index,
+    toxic_variance_multiplier,
+    toxicity_from_candles,
+)
 from glimpse_quant_bot.lmsr import LmsrBook
 from glimpse_quant_bot.options_density import (
     YEAR_SECONDS,
@@ -58,6 +68,7 @@ from glimpse_quant_bot.options_density import (
     rectify_cdf,
     risk_neutral_distribution,
 )
+from glimpse_quant_bot.pricing_kernel import physical_distribution
 from glimpse_quant_bot.types import AssetType, BucketSignal, TopicMeta
 
 log = structlog.get_logger(__name__)
@@ -365,20 +376,32 @@ def microstructure_cdf(
     bar_excess_kurtosis: float,
     imbalance: float | None,
     funding_rate: float | None,
+    *,
+    flow_drift: float | None = None,
+    toxicity_excess: float = 0.0,
+    tail_kappa: float = 0.0,
 ) -> FloatArray:
-    """CDF of the terminal price under the HAR + microstructure skewed-t model."""
+    """CDF of the terminal price under the HAR + microstructure skewed-t model.
+
+    ``flow_drift`` (integrated-OFI drift, log units) replaces the static depth
+    imbalance drift when available; ``toxicity_excess`` fattens the tails via
+    ``nu_tox = 4.2 + (nu - 4.2) exp(-tail_kappa * s)``.
+    """
     sigma = math.sqrt(max(variance, 1.0e-16))
     horizon_kurtosis = float(
         np.clip(bar_excess_kurtosis / math.sqrt(max(horizon_bars, 0.05)), 0.03, 30.0)
     )
     nu = float(np.clip(4.0 + 6.0 / horizon_kurtosis, 4.2, 200.0))
+    nu = toxic_tail_index(nu, toxicity_excess, tail_kappa)
     gamma = (
         math.exp(-FUNDING_SKEW * math.tanh(funding_rate / FUNDING_REFERENCE))
         if funding_rate is not None
         else 1.0
     )
     drift = 0.0
-    if imbalance is not None:
+    if flow_drift is not None:
+        drift = flow_drift
+    elif imbalance is not None:
         decay = math.sqrt(min(1.0, IMBALANCE_HORIZON_SECONDS / max(horizon_seconds, 1.0)))
         drift = IMBALANCE_DRIFT * float(np.clip(imbalance, -1.0, 1.0)) * sigma * decay
     location = drift - 0.5 * variance
@@ -426,6 +449,7 @@ class FastInputs:
     surface: VolSurface | None
     sources: tuple[str, ...]
     ts: float
+    flow: FlowSignal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +468,10 @@ class EnsembleForecast:
     """Weighted Jensen-Shannon divergence between components, normalised to [0, 1]."""
     kelly_multiplier: float
     spot_sources: tuple[str, ...] = field(default_factory=tuple)
+    ambiguity: float = 0.0
+    """KL radius ``eps`` for robust Kelly: ``floor + per_jsd * JSD`` (nats)."""
+    diagnostics: Mapping[str, float] = field(default_factory=dict)
+    """Kernel, flow and calibration state behind this forecast."""
 
     def probability(self, option_id: int) -> float:
         return self.probabilities.get(option_id, 0.0)
@@ -554,12 +582,19 @@ def jensen_shannon(distributions: Sequence[FloatArray], weights: Sequence[float]
 
 
 def build_forecast(
-    topic: TopicMeta, slow: SlowFit, fast: FastInputs, now: float, settings: Settings
+    topic: TopicMeta,
+    slow: SlowFit,
+    fast: FastInputs,
+    now: float,
+    settings: Settings,
+    calibration: CalibrationView | None = None,
 ) -> EnsembleForecast:
     """Pool the component densities and map them onto the topic's buckets.
 
     Pure and synchronous: every input is passed in, so the backtester can call
-    it with historical data and get exactly the live behaviour.
+    it with historical data and get exactly the live behaviour. ``calibration``
+    (learned pool weights and temperature) is optional; without it the
+    configured weights and ``tau = 1`` are used.
     """
     horizon_seconds = topic.seconds_to_expiry(now)
     if horizon_seconds <= 0.0:
@@ -569,15 +604,49 @@ def build_forecast(
 
     spot = fast.spot
     horizon_bars = horizon_seconds / slow.interval_seconds
-    variance = slow.variance(horizon_bars)
+    diagnostics: dict[str, float] = {}
+
+    # Flow toxicity scales the physical variance before anything consumes it.
+    toxicity_excess = 0.0
+    flow_drift: float | None = None
+    flow = fast.flow if settings.enable_flow_signals else None
+    if flow is not None and flow.toxicity is not None:
+        toxicity_excess = flow.toxicity.excess
+        diagnostics["vpin"] = flow.toxicity.vpin
+        diagnostics["vpin_percentile"] = flow.toxicity.percentile
+    variance = slow.variance(horizon_bars) * toxic_variance_multiplier(
+        toxicity_excess, settings.toxicity_variance_kappa
+    )
     sigma = math.sqrt(max(variance, 1.0e-16))
     t_years = horizon_seconds / YEAR_SECONDS
+    if flow is not None and flow.ofi is not None:
+        flow_drift = ofi_drift(flow.ofi, horizon_seconds, sigma, settings.ofi_drift_cap_sigmas)
+        diagnostics["ofi"] = flow.ofi.integrated
+        diagnostics["ofi_beta"] = flow.ofi.beta
+        diagnostics["ofi_drift_sigmas"] = flow_drift / sigma
 
     cdfs: dict[str, Cdf] = {}
     surface = fast.surface
     if topic.asset.has_listed_options and surface is not None:
         forward = surface.forward(spot, t_years)
-        cdfs["options_rnd"] = risk_neutral_distribution(forward, t_years, surface).cdf_at
+        rnd = risk_neutral_distribution(forward, t_years, surface)
+        if settings.enable_pricing_kernel:
+            physical, kernel = physical_distribution(
+                rnd,
+                forward,
+                variance,
+                blend=settings.kernel_blend,
+                prior_ratio=settings.kernel_prior_ratio,
+                asymmetry=settings.kernel_asymmetry,
+                log_drift=settings.physical_drift_annual * t_years,
+                max_ratio=settings.kernel_max_ratio,
+            )
+            cdfs["options_rnd"] = physical.cdf_at
+            diagnostics["kernel_xi"] = kernel.xi
+            diagnostics["kernel_gamma"] = kernel.gamma
+            diagnostics["kernel_variance_ratio"] = kernel.variance_ratio
+        else:
+            cdfs["options_rnd"] = rnd.cdf_at
 
     def micro_cdf(prices: FloatArray) -> FloatArray:
         return microstructure_cdf(
@@ -589,6 +658,9 @@ def build_forecast(
             slow.bar_excess_kurtosis,
             fast.imbalance,
             fast.funding_rate,
+            flow_drift=flow_drift,
+            toxicity_excess=toxicity_excess,
+            tail_kappa=settings.toxicity_tail_kappa,
         )
 
     cdfs["har_microstructure"] = micro_cdf
@@ -603,7 +675,12 @@ def build_forecast(
         cdfs[ts_name] = _empirical_cdf(spot * np.exp(np.sort(simulated)))
 
     weights = _resolve_weights(settings, "options_rnd" in cdfs, ts_name)
-    names = [name for name in weights if name in cdfs]
+    if calibration is not None and calibration.weights:
+        learned = {name: max(calibration.weights.get(name, 0.0), 0.0) for name in weights}
+        total_learned = sum(learned.values())
+        if total_learned > 0.0:
+            weights = {name: value / total_learned for name, value in learned.items()}
+    names = [name for name in weights if name in cdfs and weights[name] > 0.0]
 
     lows = np.array([bucket.lo for bucket in topic.buckets])
     highs = np.array([bucket.hi for bucket in topic.buckets])
@@ -635,13 +712,18 @@ def build_forecast(
     total = sum(raw.values())
     if total <= 0.0:
         raise ForecastError(f"ensemble puts no mass inside the buckets of topic {topic.topic_id}")
-    probabilities = {
-        bucket.option_id: raw.get(bucket.option_id, 0.0) / total for bucket in topic.buckets
-    }
+    pooled = np.array([raw.get(bucket.option_id, 0.0) / total for bucket in topic.buckets])
+    tau = 1.0 if calibration is None else calibration.temperature
+    if abs(tau - 1.0) > 1.0e-9:
+        pooled = apply_temperature(pooled, tau)
+        diagnostics["temperature"] = tau
+    probabilities = {bucket.option_id: float(pooled[i]) for i, bucket in enumerate(topic.buckets)}
 
-    disagreement = jensen_shannon(
-        [component_arrays[name] for name in names], [weights[name] for name in names]
-    )
+    pool_weights = [weights[name] for name in names]
+    disagreement = jensen_shannon([component_arrays[name] for name in names], pool_weights)
+    weight_entropy = -sum(w * math.log(w) for w in pool_weights if w > 0.0)
+    jsd_nats = disagreement * weight_entropy
+    ambiguity = settings.ambiguity_floor + settings.ambiguity_per_jsd * jsd_nats
     kelly_multiplier = float(
         np.clip(1.0 - 2.0 * disagreement, settings.kelly_disagreement_floor, 1.0)
     )
@@ -666,6 +748,8 @@ def build_forecast(
         disagreement=disagreement,
         kelly_multiplier=kelly_multiplier,
         spot_sources=fast.sources,
+        ambiguity=ambiguity,
+        diagnostics=diagnostics,
     )
 
 
@@ -738,6 +822,7 @@ class EnsembleForecaster:
         self._fast: dict[AssetType, FastInputs] = {}
         self._locks: dict[AssetType, asyncio.Lock] = {}
         self._timesfm = _TimesFmRunner(settings.enable_timesfm)
+        self._ofi: dict[AssetType, OfiTracker] = {}
 
     @property
     def timeseries_model(self) -> str:
@@ -783,12 +868,33 @@ class EnsembleForecaster:
                 surface=cached.surface,
                 sources=spot.sources,
                 ts=cached.ts,
+                flow=cached.flow,
             )
-        imbalance, funding, chain = await asyncio.gather(
-            self._hub.orderbook_imbalance(asset),
+        settings = self._settings
+        book, funding, chain, minute_bars = await asyncio.gather(
+            self._hub.orderbook(asset),
             self._hub.funding_rate(asset),
             self._hub.option_chain(asset),
+            self._hub.flow_candles(asset)
+            if settings.enable_flow_signals
+            else asyncio.sleep(0.0, result=()),
         )
+        imbalance = book.imbalance() if book is not None and book.bids and book.asks else None
+        flow: FlowSignal | None = None
+        if settings.enable_flow_signals:
+            tracker = self._ofi.setdefault(asset, OfiTracker(levels=settings.ofi_levels))
+            snapshot = book_levels(book, now, settings.ofi_levels) if book is not None else None
+            if snapshot is not None:
+                tracker.update(snapshot)
+            flow = FlowSignal(
+                ofi=tracker.state(settings.ofi_min_obs),
+                toxicity=toxicity_from_candles(
+                    minute_bars,
+                    settings.vpin_bucket_minutes,
+                    settings.vpin_window,
+                    settings.toxicity_threshold,
+                ),
+            )
         surface = VolSurface.from_chain(chain, now) if chain else None
         fresh = FastInputs(
             spot=spot.price,
@@ -797,13 +903,19 @@ class EnsembleForecaster:
             surface=surface,
             sources=spot.sources,
             ts=now,
+            flow=flow,
         )
         self._fast[asset] = fresh
         return fresh
 
-    async def forecast(self, topic: TopicMeta, now: float | None = None) -> EnsembleForecast:
+    async def forecast(
+        self,
+        topic: TopicMeta,
+        now: float | None = None,
+        calibration: CalibrationView | None = None,
+    ) -> EnsembleForecast:
         moment = time.time() if now is None else now
         slow, fast = await asyncio.gather(
             self.slow_fit(topic.asset, moment), self.fast_inputs(topic.asset, moment)
         )
-        return build_forecast(topic, slow, fast, moment, self._settings)
+        return build_forecast(topic, slow, fast, moment, self._settings, calibration)
