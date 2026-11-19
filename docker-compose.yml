@@ -1,11 +1,19 @@
-# Paper trading by default. Real orders need BOTH:
-#   1. GLIMPSE_LIVE_TRADING=true (in .env or the environment), and
-#   2. the command changed to ["run", "--live"].
+# Paper trading by default. Real orders need ALL of:
+#   1. GLIMPSE_LIVE_TRADING=true and GLIMPSE_API_KEY in .env,
+#   2. `--allow-live` added to the api command below, and
+#   3. the typed two-step arming flow in the terminal UI (or `run --live` for the headless bot).
 #
-#   docker compose up --build                         # run the bot (paper)
-#   docker compose run --rm bot demo-trades           # one-shot example trades
-#   docker compose run --rm bot report                # ledger summary
-#   docker compose --profile record up recorder       # record the feed for backtests
+#   docker compose up --build                          # terminal: api :8000 + frontend :3000 (paper)
+#   docker compose run --rm --service-ports api serve --host 0.0.0.0 --demo
+#                                                      # same UI on the simulated venue (no network)
+#   docker compose --profile headless up bot           # headless loop (stop `api` first!)
+#   docker compose run --rm api demo-trades            # one-shot example trades
+#   docker compose run --rm api report                 # ledger summary
+#   docker compose --profile record up recorder        # record the feed for backtests
+#
+# Only ONE engine may own the ledger at a time: `api` and `bot` share the
+# `ledger` volume, so `bot` lives behind a profile and never starts by default.
+# Ports are published on 127.0.0.1 only: the control plane has no login.
 
 x-bot: &bot
   build: .
@@ -22,8 +30,41 @@ x-bot: &bot
   stop_grace_period: 30s
 
 services:
+  api:
+    <<: *bot
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the browser bundle: the browser (not the container) calls these.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000/ws/telemetry}
+    image: glimpse-quant-terminal:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   bot:
     <<: *bot
+    profiles: ["headless"]
     command: ["run"]
     restart: unless-stopped
 

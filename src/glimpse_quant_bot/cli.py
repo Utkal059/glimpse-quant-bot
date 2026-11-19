@@ -6,9 +6,11 @@
     glimpse-quant-bot backtest       walk-forward replay of a recording
     glimpse-quant-bot report         ledger summary and recent fills
     glimpse-quant-bot reconcile      align the live ledger with the exchange
+    glimpse-quant-bot serve          Quant Terminal API + WebSocket (paper-first)
 
 Real orders require BOTH ``--live`` on ``run`` and ``GLIMPSE_LIVE_TRADING=true``
-in the environment. Every other command is read-only or paper-only.
+in the environment. ``serve`` needs ``--allow-live``, the same environment flag
+and a typed arming step in the UI. Every other command is read-only or paper-only.
 """
 
 from __future__ import annotations
@@ -422,6 +424,103 @@ async def cmd_reconcile(args: argparse.Namespace) -> int:
 # --- entry point --------------------------------------------------------------
 
 
+_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+async def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the Quant Terminal control plane and the engine in one event loop."""
+    try:
+        import uvicorn
+
+        from glimpse_quant_bot.server import (
+            EngineController,
+            create_app,
+            glimpse_venue,
+            simulated_venue,
+        )
+        from glimpse_quant_bot.server.api import DEFAULT_HOSTS, DEFAULT_ORIGINS
+        from glimpse_quant_bot.server.controller import configure_logging as configure_tap
+        from glimpse_quant_bot.server.simulation import SimulatedWorld
+        from glimpse_quant_bot.server.telemetry import TelemetryHub
+    except ImportError as exc:
+        console.print(
+            f"[red]The terminal server needs extra packages ({exc.name}).[/red] "
+            'Install them with: pip install -e ".[server]"'
+        )
+        return 2
+    if args.demo and args.allow_live:
+        console.print("[red]--demo runs the simulated venue, which can never trade live.[/red]")
+        return 2
+
+    load_dotenv()
+    base: dict[str, Any] = {}
+    data_dir = args.data_dir or ("data/terminal-demo" if args.demo else None)
+    if data_dir is not None:
+        base["data_dir"] = Path(data_dir)
+    if args.demo:
+        # Every simulated world numbers its topics from scratch, so a paper ledger
+        # from an earlier run would point at markets that no longer exist (or at
+        # different ones under the same id). Each demo run gets its own ledger.
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        base["data_dir"] = Path(data_dir or "data/terminal-demo") / f"sim-{stamp}"
+    if args.min_expected_gain_sats is not None:
+        base["min_expected_gain_sats"] = args.min_expected_gain_sats
+    if args.max_horizon_hours is not None:
+        base["max_horizon_hours"] = args.max_horizon_hours
+
+    def settings_factory(**overrides: Any) -> Settings:
+        return load_settings(**{**base, **overrides})
+
+    settings = settings_factory()
+    telemetry = TelemetryHub()
+    configure_tap(settings, telemetry)
+    venue = simulated_venue(SimulatedWorld(settings.assets)) if args.demo else glimpse_venue()
+    autostart = args.demo if args.autostart is None else bool(args.autostart)
+    controller = EngineController(
+        settings_factory=settings_factory,
+        venue=venue,
+        allow_live=bool(args.allow_live),
+        autostart=autostart,
+        telemetry=telemetry,
+    )
+    hosts = [*DEFAULT_HOSTS, *args.allowed_host]
+    if args.host not in _LOOPBACK:
+        console.print(
+            f"[yellow]Binding {args.host}: the control plane has no login. Keep the port on "
+            "a trusted network (docker-compose publishes it on 127.0.0.1 only).[/yellow]"
+        )
+    app = create_app(
+        controller,
+        allowed_origins=[*DEFAULT_ORIGINS, *args.cors_origin],
+        allowed_hosts=hosts,
+    )
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"API        http://{args.host}:{args.port}/api/health",
+                    f"Telemetry  ws://{args.host}:{args.port}/ws/telemetry",
+                    f"Venue      {venue.name}{' (paper only)' if args.demo else ''}",
+                    f"Ledger     {settings.ledger_path}",
+                    f"Live       {'armable from the UI' if args.allow_live else 'disabled'}",
+                ]
+            ),
+            title="Glimpse Quant Terminal",
+        )
+    )
+    config = uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+        access_log=False,
+        ws_max_size=65_536,
+        lifespan="on",
+    )
+    await uvicorn.Server(config).serve()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="glimpse-quant-bot",
@@ -487,6 +586,40 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile", help="align the live ledger with the exchange")
     common(reconcile)
     reconcile.set_defaults(handler=cmd_reconcile)
+
+    serve = sub.add_parser("serve", help="Quant Terminal API + WebSocket (paper-first)")
+    common(serve)
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default loopback)")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--demo",
+        action="store_true",
+        help="simulated Glimpse venue: no network, no API key, paper only",
+    )
+    serve.add_argument(
+        "--allow-live",
+        action="store_true",
+        help="let the UI arm live trading (still needs GLIMPSE_LIVE_TRADING=true + API key)",
+    )
+    serve.add_argument(
+        "--autostart",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="start the paper engine on boot (default: on for --demo, off otherwise)",
+    )
+    serve.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        help="extra browser origin allowed to call the API (repeatable)",
+    )
+    serve.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        help="extra Host header value to accept (repeatable)",
+    )
+    serve.set_defaults(handler=cmd_serve)
     return parser
 
 

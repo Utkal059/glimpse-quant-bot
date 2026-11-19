@@ -17,8 +17,8 @@ MarketDataHub ──▶ EnsembleForecaster ──▶ SlippageOptimizer ──▶
 
 | Check | Result |
 |---|---|
-| `pytest` | 54 passed |
-| `ruff check src tests` | clean |
+| `pytest` | 134 passed (incl. 33 terminal-server safety tests) |
+| `ruff check .` | clean |
 | `mypy --strict` on `src` and `tests` | clean |
 | Local LS-LMSR pricer vs live `/trades/estimate` | identical to the millisat (buy, sell, multi-leg, fractional) |
 | Local LS-LMSR pricer vs the Glimpse whitepaper | reproduces every published figure |
@@ -116,13 +116,47 @@ Optional TimesFM 2.5 (Apache-2.0, pulls in PyTorch): `pip install -e ".[timesfm]
 docker compose up --build
 ```
 
-The ledger and recordings live on named volumes (`ledger`, `recordings`). `docker compose run --rm bot demo-trades` runs any other command; `docker compose --profile record up recorder` records the feed for a day.
+That starts the terminal API (`api`, on `127.0.0.1:8000`, paper mode) and the UI (`frontend`, on `127.0.0.1:3000`). The ledger and recordings live on named volumes (`ledger`, `recordings`). `docker compose run --rm --service-ports api serve --host 0.0.0.0 --demo` runs the API against the simulated venue instead; `docker compose run --rm bot demo-trades` runs any other command; `docker compose --profile record up recorder` records the feed for a day. The headless `bot` service sits in the `headless` profile so it never shares the ledger with `api`.
+
+## Quant Terminal
+
+A local web terminal over the running engine: a FastAPI + WebSocket server (`glimpse-quant-bot serve`) in the same event loop as the trading loop, and a Next.js UI in [`frontend/`](frontend/). It adds no pricing, sizing or risk logic of its own; [`docs/TERMINAL.md`](docs/TERMINAL.md) maps every panel to the engine object behind it.
+
+```bash
+pip install -e ".[server]"
+glimpse-quant-bot serve --demo        # simulated venue, no network, no key, paper only
+# or: glimpse-quant-bot serve         # live Glimpse feed, paper trading
+```
+
+```bash
+cd frontend
+npm install
+npm run dev                           # http://localhost:3000
+```
+
+What it shows:
+
+- **Top ribbon:** BTC/ETH/SOL/GOLD spot, WebSocket latency, `PAPER MODE` / `LIVE ARMED`, the intraday drawdown against the −6% breaker, lock state and the kill switch.
+- **Distribution chart:** all 500 buckets of the focused market (zoom from spot ±30 buckets to the full range), market quotes as bars, the ensemble as a line, toggles for the options RND, HAR-RV and GJR-GARCH components, and +EV buckets after fees highlighted.
+- **Bucket inspector:** click a bar to see the LS-LMSR cost of buying k = 1…50 contracts, where the marginal edge turns negative, and a test-order ticket that goes through `RiskManager` → `ExecutionRouter` → `Ledger`.
+- **Side panels:** run parameters and start/stop/reconcile, ensemble agreement (JSD gauge, κ ∈ [0.25, 1]), and exposure against the 15% bucket and 35% topic caps.
+- **Tabs:** open positions (entry, mark, take-profit, invalidation, unrealised P&L in sats), fills and ledger, performance, and logs filterable by `INFO` / `SIGNAL` / `EXECUTION` / `RISK_LOCK`.
+
+Safety, enforced by the server rather than the UI (each rule has a test in `tests/test_server.py`):
+
+- Paper is the default of every request and of the engine. Going live needs `GLIMPSE_LIVE_TRADING=true`, `GLIMPSE_API_KEY`, `serve --allow-live`, the real venue, and a typed arming phrase that yields a single-use token valid for 60 s. The simulator can never go live.
+- Risk caps, the drawdown limit and the Kelly fraction cannot be changed over HTTP; request models reject unknown fields.
+- Page loads and the WebSocket read in-memory state only, so refreshing the UI makes no Glimpse REST calls.
+- The server binds to `127.0.0.1`. Mutating requests need an allowed `Origin` and the `X-GQB-Intent: operator` header, and the WebSocket checks `Origin`.
+
+The TypeScript API types in `frontend/src/lib/contract.ts` are generated from the Pydantic models (`python -m glimpse_quant_bot.server.typescript > frontend/src/lib/contract.ts`); a test fails if they drift.
 
 ## CLI reference
 
 | Command | What it does | Places orders? |
 |---|---|---|
 | `run [--live] [--duration S]` | Stream-driven trading loop with reconnect | Only with `--live` **and** `GLIMPSE_LIVE_TRADING=true` |
+| `serve [--demo] [--allow-live] [--port N]` | Quant Terminal API + WebSocket around the same engine | Paper by default; live needs `--allow-live`, `GLIMPSE_LIVE_TRADING=true`, an API key and typed arming in the UI |
 | `demo-trades [--max-trades N] [--out FILE]` | One-shot scan, server-priced ladders, paper fills, Markdown report | Never |
 | `record [--duration S] [--out DIR]` | Records the WebSocket feed (`MarketRecorder` NDJSON), spot, candles, metadata | Never |
 | `backtest --synthetic \| --data-dir DIR` | Walk-forward replay: Sharpe, Sortino, max drawdown, win rate, ROI | Never |
@@ -193,7 +227,11 @@ src/glimpse_quant_bot/
   strategy.py          glimpse_markets.Strategy subclass for StrategyRunner
   backtester.py        walk-forward replay and synthetic world
   demo.py, cli.py      example-trades generator and command line
-tests/                 54 tests: density, pricer, optimiser, reconciler, replay
+  server/              Quant Terminal: controller, FastAPI app, telemetry hub,
+                       Pydantic contract, TypeScript generator, simulated venue
+frontend/              Next.js Quant Terminal UI (TypeScript strict, Tailwind)
+docs/TERMINAL.md       how the terminal maps onto the engine and keeps its safety rules
+tests/                 density, pricer, optimiser, reconciler, replay, terminal server
 examples/sample_trades.md
 ```
 
