@@ -4,6 +4,10 @@ A probability-calibration and LS-LMSR execution engine for [Glimpse](https://www
 
 It is built on the official SDK (`glimpse-markets >= 0.2.0`), is MIT-licensed, and **paper-trades by default**: Glimpse has no sandbox, so real orders need two separate opt-ins.
 
+![Quant Terminal: market screener, 500-bucket distribution with the ensemble model over market quotes, +EV buckets, engine and ensemble panels](docs/screenshots/01-terminal-overview.png)
+
+<sub>The [Quant Terminal](#quant-terminal) running `glimpse-quant-bot serve --demo` (simulated venue, paper only). More screenshots [below](#screenshots).</sub>
+
 ```text
 MarketDataHub ──▶ EnsembleForecaster ──▶ SlippageOptimizer ──▶ RiskManager ──▶ ExecutionRouter
  Deribit options     options RND             local LS-LMSR         caps, breaker,    SDK calls,
@@ -141,6 +145,28 @@ What it shows:
 - **Bucket inspector:** click a bar to see the LS-LMSR cost of buying k = 1…50 contracts, where the marginal edge turns negative, and a test-order ticket that goes through `RiskManager` → `ExecutionRouter` → `Ledger`.
 - **Side panels:** run parameters and start/stop/reconcile, ensemble agreement (JSD gauge, κ ∈ [0.25, 1]), and exposure against the 15% bucket and 35% topic caps.
 - **Tabs:** open positions (entry, mark, take-profit, invalidation, unrealised P&L in sats), fills and ledger, performance, and logs filterable by `INFO` / `SIGNAL` / `EXECUTION` / `RISK_LOCK`.
+
+### Screenshots
+
+Captured from `glimpse-quant-bot serve --demo`: the simulated venue, so spot prices and fills are synthetic and every order is a paper fill. Paper trades against live Glimpse markets are in [`examples/sample_trades.md`](examples/sample_trades.md).
+
+**Bucket inspector.** Clicking a bar prices k = 1…50 contracts on the local LS-LMSR replica. The cost curve crosses the model's fair value where the marginal contract stops paying, and expected profit peaks at the optimiser's k\*.
+
+![Bucket inspector with LS-LMSR cost curve, expected profit by size and a paper test-order ticket](docs/screenshots/02-bucket-inspector.png)
+
+**Open positions.** Entry, mark, take-profit trigger and invalidation level for each paper position. The exit rule flips to *take profit* when the market converges to the model, and the next mark tick sells it.
+
+![Open positions with take-profit and invalidation levels](docs/screenshots/03-positions.png)
+
+**Fills and ledger.** Every paper fill from the append-only ledger, with executed price against quote (the slippage), cash flow and commission.
+
+![Fills and ledger](docs/screenshots/04-fills-ledger.png)
+
+**Performance and logs.** The paper equity curve, plus the structured event stream: `EXECUTION` rows for fills, `RISK_LOCK` rows for every entry the risk manager refused, and why.
+
+![Paper equity and performance metrics](docs/screenshots/05-performance.png)
+
+![Log stream filtered by level](docs/screenshots/06-logs.png)
 
 Safety, enforced by the server rather than the UI (each rule has a test in `tests/test_server.py`):
 

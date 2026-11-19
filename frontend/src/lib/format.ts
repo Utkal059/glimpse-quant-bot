@@ -15,7 +15,10 @@ function withSign(text: string, value: number, always: boolean): string {
   return text;
 }
 
-/** "12,345 sats" (sub-sat amounts keep up to 3 decimals). */
+/**
+ * "12,345 sats". Amounts under 100 sats keep one decimal ("13.1 sats"): three
+ * decimals ("13.123") read as thirteen thousand under a European locale.
+ */
 export function formatSats(
   value: Millisats | null | undefined,
   opts: { signed?: boolean; unit?: boolean; compact?: boolean } = {},
@@ -26,7 +29,7 @@ export function formatSats(
   let text: string;
   if (opts.compact === true && magnitude >= 10_000) text = compactFormat.format(magnitude);
   else if (magnitude >= 100 || Number.isInteger(magnitude)) text = intFormat.format(magnitude);
-  else text = magnitude.toLocaleString("en-US", { maximumFractionDigits: 3 });
+  else text = magnitude.toLocaleString("en-US", { maximumFractionDigits: 1 });
   const out = withSign(text, sats, opts.signed ?? false);
   return opts.unit === false ? out : `${out} sats`;
 }

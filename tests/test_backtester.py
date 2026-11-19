@@ -125,6 +125,10 @@ def test_performance_metrics() -> None:
     assert sortino == pytest.approx(returns.mean() / 0.10 * annualise)
     assert max_drawdown == pytest.approx(0.10)
 
+    # Two points: no Sharpe/Sortino yet, but the drawdown is already real.
+    assert performance_metrics([(0, 100), (300, 95)], 300) == pytest.approx((0.0, 0.0, 0.05))
+    assert performance_metrics([], 300) == (0.0, 0.0, 0.0)
+
 
 # --- forecaster components exercised by the replay ---------------------------
 

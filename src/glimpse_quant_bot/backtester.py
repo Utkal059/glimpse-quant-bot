@@ -264,8 +264,14 @@ def performance_metrics(
     ``sqrt(steps per year)`` (zero risk-free rate).
     """
     equity = np.array([value for _, value in equity_curve], dtype=np.float64)
-    if equity.size < 3:
+    if equity.size == 0:
         return 0.0, 0.0, 0.0
+    peak = np.maximum.accumulate(equity)
+    max_drawdown = float(np.max((peak - equity) / peak))
+    if equity.size < 3:
+        # Too few returns for a meaningful Sharpe/Sortino, but a drawdown is
+        # already real after two points and must not be reported as zero.
+        return 0.0, 0.0, max_drawdown
     returns = np.diff(equity) / equity[:-1]
     annualise = math.sqrt(YEAR_SECONDS / step_seconds)
     spread = float(returns.std())
@@ -273,8 +279,6 @@ def performance_metrics(
     downside = returns[returns < 0.0]
     downside_spread = math.sqrt(float((downside**2).mean())) if downside.size else 0.0
     sortino = float(returns.mean()) / downside_spread * annualise if downside_spread > 0.0 else 0.0
-    peak = np.maximum.accumulate(equity)
-    max_drawdown = float(np.max((peak - equity) / peak))
     return sharpe, sortino, max_drawdown
 
 
